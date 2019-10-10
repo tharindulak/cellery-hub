@@ -158,6 +158,8 @@ func TestValidateAccess(t *testing.T) {
 		{[]string{"pull"}, "wso2.com", "cellery/newImag", authLabels},
 		{[]string{"pull"}, "admin@wso2.com", "cellery/image", authLabels},
 		{[]string{"pull", "push"}, "admin.com", "cellery/image", authLabels},
+		//  owner user trying to push to existing image
+		{[]string{"pull", "push"}, "admin.com", "cellery/existingImage", authLabels},
 		//	user trying to push with a new image which does not exists in the db
 		{[]string{"pull", "push"}, "admin.com", "cellery/sample", authLabels},
 		//	user that is not in the db trying to pull a public image
@@ -197,6 +199,8 @@ func TestInvalidAccess(t *testing.T) {
 		{[]string{"pull", "push"}, "pull.com", "cellery/image", authLabels},
 		//	user trying to pull a public image
 		{[]string{"pull"}, "other.com", "cellery/newImage", authLabels},
+		//  a non owner user trying to push to existing image
+		{[]string{"pull", "push"}, "other.com", "cellery/existingImage", authLabels},
 		{[]string{"pull", "push"}, "other.com", "cellery/image", authLabels},
 		{[]string{"pull", "push"}, "other.com", "cellery/pqr", authLabels},
 	}
@@ -217,15 +221,18 @@ func TestIsAuthorizedToPush(t *testing.T) {
 	values := []struct {
 		username     string
 		organization string
+		image string
 	}{
-		{"wso2.com", "cellery"},
-		{"admin.com", "cellery"},
+		{"wso2.com", "cellery", "image"},
+		{"admin.com", "cellery", "newImage"},
 	}
 	logger := zap.NewExample().Sugar()
 	for _, value := range values {
-		isAuthorized, err := isAuthorizedToPush(dbConnection, value.username, value.organization, logger, testUser)
+		isAuthorized, err := isAuthorizedToPush(dbConnection, value.username, value.organization, value.image,
+			logger, testUser)
 		if !isAuthorized {
-			t.Error("Cannot authorize ", value.username, "for ", value.organization, " organization")
+			t.Error("Cannot authorize ", value.username, "for ", value.organization, "organization",
+				value.image, "image")
 		}
 		if err != nil {
 			log.Println("Error while pushing :", err)

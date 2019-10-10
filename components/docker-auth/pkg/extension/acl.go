@@ -22,6 +22,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"go.uber.org/zap"
@@ -64,7 +65,7 @@ func IsUserAuthorized(db *sql.DB, actions []string, username string, repository 
 		if isPullOnly {
 			logger.Debugf("[%s] Validating access for unauthenticated user for pull action", execId)
 		} else {
-			logger.Debugf("[%s] Denying access for unauthenticated user for push/delete actions", execId)
+			logger.Debugf("[%s] Denying access for unauthenticated user for push/delete actions\n", execId)
 			return false, nil
 		}
 	}
@@ -73,18 +74,18 @@ func IsUserAuthorized(db *sql.DB, actions []string, username string, repository 
 	if err != nil {
 		return false, err
 	}
-	logger.Debugf("[%s] Image name is declared as :%s", execId, image)
+	logger.Debugf("[%s] Image name is declared as :%s\n", execId, image)
 	if isPullOnly {
-		logger.Debugf("[%s] Received a pulling task", execId)
+		logger.Debugf("[%s] Received a pulling task\n", execId)
 		return isAuthorizedToPull(db, username, organization, image, logger, execId)
 	} else if isPushAction {
-		logger.Debugf("[%s] Received a pushing task", execId)
-		return isAuthorizedToPush(db, username, organization, logger, execId)
+		logger.Debugf("[%s] Received a pushing task\n", execId)
+		return isAuthorizedToPush(db, username, organization, image, logger, execId)
 	} else if isPullNDeleteAction {
-		logger.Debugf("[%s] Received a deleting task", execId)
+		logger.Debugf("[%s] Received a deleting task\n", execId)
 		return isAuthorizedToDelete(db, username, organization, logger, execId)
 	} else {
-		logger.Debugf("[%s] Received an unrecognized task", execId)
+		logger.Debugf("[%s] Received an unrecognized task\n", execId)
 		return false, fmt.Errorf("unrecognized task requested")
 	}
 }
@@ -110,7 +111,7 @@ func getImageVisibility(db *sql.DB, image string, organization string, logger *z
 		closeResultSet(results, "getImageVisibility", logger, execId)
 	}()
 	if err != nil {
-		return visibility, fmt.Errorf("error while executing the mysql query getVisibilityQuery :%s", err)
+		return visibility, fmt.Errorf("error while calling the mysql query getVisibilityQuery :%s", err)
 	}
 	if results.Next() {
 		err = results.Scan(&visibility)
@@ -130,12 +131,13 @@ func getImageVisibility(db *sql.DB, image string, organization string, logger *z
 func isUserAvailable(db *sql.DB, organization, user string, logger *zap.SugaredLogger, execId string) (bool, error) {
 	logger.Debugf("[%s] Checking whether the user %s exists in the organization %s", execId, user,
 		organization)
-	results, err := db.Query(getUserAvailabilityQuery, user, organization)
+	results, err := db.Query(checkOwnerQuery, user, organization)
 	defer func() {
 		closeResultSet(results, "isUserAvailable", logger, execId)
 	}()
 	if err != nil {
-		return false, fmt.Errorf("error while executing the mysql query getUserAvailabilityQuery :%s\n", err)
+		return false, fmt.Errorf("[%s] Error while calling the mysql query "+
+			"checkOwnerQuery :%s\n", execId, err)
 	}
 	if results.Next() {
 		logger.Debugf("[%s] User %s is available in the organization :%s", execId, user, organization)
@@ -150,7 +152,7 @@ func isAuthorizedToPull(db *sql.DB, user string, organization string, image stri
 	logger *zap.SugaredLogger, execId string) (bool, error) {
 
 	logger.Debugf("[%s] ACL is checking whether the user %s is authorized to pull the image %s in the "+
-		" organization %s.", execId, user, image, organization)
+		" organization %s.\n", execId, user, image, organization)
 
 	visibility, err := getImageVisibility(db, image, organization, logger, execId)
 
@@ -171,35 +173,80 @@ func isAuthorizedToPull(db *sql.DB, user string, organization string, image stri
 	}
 }
 
-func isAuthorizedToPush(db *sql.DB, user string, organization string,
+func isAuthorizedToPush(db *sql.DB, user string, organization string, image string,
 	logger *zap.SugaredLogger, execId string) (bool, error) {
 
-	logger.Debugf("[%s] User %s is trying to push to organization :%s", execId, user, organization)
-	results, err := db.Query(getUserRoleQuery, user, organization)
+	logger.Debugf("[%s] User %s is trying to push to organization :%s. Checking whether image "+
+		"exists in the database \n", execId, user, organization)
+	results, err := db.Query(checkImageQuery, image)
+	if err != nil {
+		return false, fmt.Errorf("[%s] Error while calling the mysql query "+
+			"check image query :%s", execId, err)
+	}
 	defer func() {
 		closeResultSet(results, "isAuthorizedToPush", logger, execId)
 	}()
-	if err != nil {
-		return false, fmt.Errorf("error while executing the mysql query getUserRoleQuery :%s", err)
-	}
 	if results.Next() {
+		logger.Debugf("[%s] Image exists in the registry. User privileges to push will be evaluated",
+			execId)
+		results, err := db.Query(getPermissionQuery, user, organization, image)
 		var userRole string
-		// for each row, scan the result into our tag composite object
-		err = results.Scan(&userRole)
-		if err != nil {
-			return false, fmt.Errorf("[%s] Error in retrieving the username role from the "+
-				"database :%s", execId, err)
+		i := 0
+		for ; results.Next(); i++ {
+			err = results.Scan(&userRole)
+			if err != nil {
+				return false, fmt.Errorf("[%s] Error in retrieving the username role from the "+
+					"database :%s", execId, err)
+			}
+			userPermission, err := strconv.ParseInt(userRole, 10, 64)
+			if err != nil {
+				return false, fmt.Errorf("error while pasing string to int :%v", err)
+			}
+			if (userPermission == userAdminRole) || (userPermission == userPushRole) {
+				logger.Debugf("[%s] User is allowed to push the image", execId)
+				defer func() {
+					closeResultSet(results, "isAuthorizedToPush", logger, execId)
+				}()
+				return true, nil
+			}
 		}
-		logger.Errorf("[%s] User role is declared as %s\n", execId, userRole)
-		if (userRole == userAdminRole) || (userRole == userPushRole) {
-			logger.Debugf("[%s] User is allowed to push the image", execId)
-			return true, nil
-		} else {
-			logger.Debugf("[%s] User does not have push rights", execId)
+		if i == 0 {
+			results, err = db.Query(checkOwnerQuery, user, organization)
+			defer func() {
+				closeResultSet(results, "isAuthorizedToPush", logger, execId)
+			}()
+			if err != nil {
+				return false, fmt.Errorf("[%s] Error while calling the mysql query "+
+					"checkOwnerQuery :%s", execId, err)
+			}
+			if results.Next() {
+				return true, nil
+			}
+		}
+		return false, nil
+	} else {
+		results, err := db.Query(checkOwnerQuery, user, organization)
+		defer func() {
+			closeResultSet(results, "isAuthorizedToPush", logger, execId)
+		}()
+		if err != nil {
+			return false, fmt.Errorf("[%s] Error while calling the mysql query "+
+				"checkOwnerQuery :%s", execId, err)
+		}
+		isUserAvailable, err := isUserAvailable(db, organization, user, logger, execId)
+		if err != nil {
 			return false, err
 		}
+		if isUserAvailable {
+			logger.Debugf("[%s] User: %s is member of the organization and push is allowed %s",
+				execId, user, organization)
+			return true, nil
+		} else {
+			logger.Debugf("[%s] User: %s is not a member of the organization %s", execId, user,
+				organization)
+			return false, nil
+		}
 	}
-	return false, nil
 }
 
 func isAuthorizedToDelete(db *sql.DB, user string, organization string,
@@ -207,7 +254,7 @@ func isAuthorizedToDelete(db *sql.DB, user string, organization string,
 
 	logger.Debugf("[%s] User %s is trying to perform delete action on organization :%s", execId, user,
 		organization)
-	results, err := db.Query(getUserRoleQuery, user, organization)
+	results, err := db.Query(getPermissionQuery, user, organization)
 	defer func() {
 		closeResultSet(results, "isAuthorizedToDelete", logger, execId)
 	}()
@@ -222,10 +269,15 @@ func isAuthorizedToDelete(db *sql.DB, user string, organization string,
 			logger.Debugf("[%s] Error in retrieving the user role from the database :%s", execId, err)
 			return false, err
 		}
-		logger.Debugf("[%s] User role is declared as %s for the organization %s", execId,
-			userRole, organization)
-		if userRole == userAdminRole {
-			logger.Debugf("[%s] User is allowed to delete the image under organization %s", execId, organization)
+		logger.Debugf("[%s] User role is declared as %s for the organization %s", execId, userRole,
+			organization)
+		userPermission, err := strconv.ParseInt(user, 10, 64)
+		if err != nil {
+			return false, fmt.Errorf("error while pasing string to int :%v", err)
+		}
+		if userPermission == userAdminRole {
+			logger.Debugf("[%s] User is allowed to delete the image under organization %s", execId,
+				organization)
 			return true, nil
 		} else {
 			logger.Debugf("[%s] User does not have delete rights to delete images of organization %s", execId,
